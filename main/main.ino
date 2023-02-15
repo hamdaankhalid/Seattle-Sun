@@ -12,7 +12,8 @@ that i live in Seattle.
 // ------------------------------------ Longitude and Latitude For Your Location ------------------------------------
 const double lat = 47.36;
 const double lon = -122.19;
-const double utcOffset = 48000
+const double utcOffset = 480.00;
+const int smootheningOffset = 25; // Offset in minutes to make a smoother transition for when the sky goes bright and dark
 // ------------------------------------------------------------------------------------------------------------------
 
 const int brightnessUpdateInterval = 60000; // Every minute
@@ -23,7 +24,7 @@ class MilitaryTimeFormat : public Printable  {
   int hour; // 1 - 24
   int minutes; // 1 - 60
   
-  static MilitaryTimeFormat FromMinutes(int minutes): originalMinutes(minutes) {
+  static MilitaryTimeFormat FromMinutes(int minutes) {
     int hour = minutes / 60;
     int remainingMinutes = minutes % 60;
     return MilitaryTimeFormat(hour, remainingMinutes);
@@ -31,7 +32,7 @@ class MilitaryTimeFormat : public Printable  {
 
   size_t printTo(Print& p) const {
     size_t r = 0;
-    r += p.print("Hour ");
+    r += p.print("Hour: ");
     r += p.print(hour);
     r += p.print(" Minutes: ");
     r += p.print(minutes);
@@ -42,7 +43,9 @@ class MilitaryTimeFormat : public Printable  {
     return MilitaryTimeFormat::FromMinutes(originalMinutes - rhs.originalMinutes);
   }
   
-  MilitaryTimeFormat(int hr, int mins): hour(hr), minutes(mins) {}
+  MilitaryTimeFormat(int hr, int mins): hour(hr), minutes(mins) {
+    originalMinutes = hr*60 + mins;
+  }
 };
 
 // https://gml.noaa.gov/grad/solcalc/solareqns.PDF
@@ -52,57 +55,43 @@ class SunBrightnessConvertor {
   SunBrightnessConvertor(double currentLatitude, double currentLongitude):
   latitude(currentLatitude), longitude(currentLongitude) {}
 
-  int SunBrightnessNow() const {
-    // Todo get time now
-    int dayOfYear = 44;
-    int currentYear = 2023;
-    int hr = 20;
-    int min = 15;
-  
+  /** If the time input is before dawn or time now is after dusk return 0
+    draw a Hill like distrbution with evenly spaced increments and decrements where solar noon is peak
+    From the time between dawn to solarNoon divide the space by 0-100 in increments of 1 minute
+    From the time between solarNoon to dusk divide the space by 100-0 in decrements of 1 minute
+  **/
+  int SunBrightnessNow(int dayOfYear, int currentYear, int hr, int min) const {
     double fractionalYear = calcFractionalYear(currentYear, dayOfYear, hr);
     double equationOfTime = calcEquationOfTime(fractionalYear);
     double solarDeclinationAngle = calcSolarDeclinationAngle(fractionalYear);
     double unsignedHourAngle = calcUnsignedHourAngle(solarDeclinationAngle);
-
+    
+    // smoothening offset starts the day just a little earlier so we can start increasing our brightness gradually instead of starting right at sunrise
+    MilitaryTimeFormat dawn = MilitaryTimeFormat::FromMinutes((int)calcDawnUtc(unsignedHourAngle, equationOfTime) - utcOffset - smootheningOffset);
+    // SolarNoon does not need to be smoothened since its not an extreme end of the clock
     MilitaryTimeFormat solarNoon = MilitaryTimeFormat::FromMinutes((int)calcSolarNoon(equationOfTime) - utcOffset);
-    MilitaryTimeFormat dusk = MilitaryTimeFormat::FromMinutes((int)calcDuskUtc(unsignedHourAngle, equationOfTime) - utcOffset);
-    MilitaryTimeFormat dawn = MilitaryTimeFormat::FromMinutes((int)calcDawnUtc(unsignedHourAngle, equationOfTime) - utcOffset);
+    // smoothening offset ends the day just a little later so we can start decreasing our brightness gradually instead of going right to 0 at sundown
+    MilitaryTimeFormat dusk = MilitaryTimeFormat::FromMinutes((int)calcDuskUtc(unsignedHourAngle, equationOfTime) - utcOffset +  smootheningOffset);
 
-    Serial.println("Dawn: ");
-    Serial.println(dawn);
-
-    Serial.println("Solar Noon: ");
-    Serial.println(solarNoon);
-    
-    Serial.println("Dusk: ");
-    Serial.println(dusk);
-
-    // If the time now is before dawn or time now is after dusk return 0
-    // draw a Hill like distrbution with evenly spaced increments and decrements where solar noon is peak
-    // From the time between dawn to solarNoon divide the space by 0-100 in increments of 1 minute
-    // From the time between solarNoon to dusk divide the space by 100-0 in decrements of 1 minute
     MilitaryTimeFormat now(hr, min);
-    
+
     // before dawn or after dusk
-    if ((now - dawn) < 0 || (now - dusk) > 0){
+    if ((now - dawn).originalMinutes < 0 || (now - dusk).originalMinutes > 0){
       return 0;
     }
 
     // b/w dawn and solar noon
-    if ((now - solarNoon) < 0) {
-      int minsToPeak = (solarNoon - dawn).originalMinutes;
-      double stepSize = (double) minsToPeak / 100.00;
+    if ((now - solarNoon).originalMinutes < 0) {
+      int totalMinsToPeak = (solarNoon - dawn).originalMinutes;
       // where does now fall in this distribution?
       int currentRelativePlacement = (now - dawn).originalMinutes;
-      return currentRelativePlacement*stepsize;
+      return ((double)currentRelativePlacement/(double)totalMinsToPeak)*100;
     }
 
     // b/w solarNoon and dusk
-    int minsToPeak = (dusk - solarNoon).originalMinutes;
-    double stepSize = (double) minsToPeak / 100.00;
-    // TODO start from 100 at solarNoon to 0 :)
-
-    return 0;
+    int totalMinsToPeak = (dusk - solarNoon).originalMinutes;
+    int currentRelativePlacement = (now - solarNoon).originalMinutes;
+    return 100 - ((double)currentRelativePlacement/(double)totalMinsToPeak)*100;
   }
 
   private:
@@ -168,10 +157,19 @@ SunBrightnessConvertor sbc(lat, lon);
 void setup() {
   // put your setup code here, to run once:
   Serial.begin(9600);
+  Serial.println("Begin Night Watch");
 }
 
 void loop() {
-  sbc.SunBrightnessNow();
+  // Todo get time now
+  int dayOfYear = 45;
+  int currentYear = 2023;
+  int hr = 14;
+  int min = 47;
+
+  int sunlightBrightness = sbc.SunBrightnessNow(dayOfYear, currentYear, hr, min);
+  Serial.print("Current Brightness percentage: ");
+  Serial.println(sunlightBrightness);
 
   delay(brightnessUpdateInterval);
 }
